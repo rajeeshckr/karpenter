@@ -49,9 +49,12 @@ func NewMultiNodeConsolidation(c consolidation) *MultiNodeConsolidation {
 
 func (m *MultiNodeConsolidation) ComputeCommand(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) (Command, error) {
 	if m.IsConsolidated() {
+		log.FromContext(ctx).V(1).Info("multi-node consolidation already satisfied, skipping")
 		return Command{}, nil
 	}
 	candidates = m.sortCandidates(candidates)
+	logger := log.FromContext(ctx).WithValues("candidate-count", len(candidates), "candidates", summarizeCandidatesForLog(candidates))
+	logger.V(1).Info("evaluating multi-node consolidation candidates")
 
 	// In order, filter out all candidates that would violate the budget.
 	// Since multi-node consolidation relies on the ordering of
@@ -63,26 +66,36 @@ func (m *MultiNodeConsolidation) ComputeCommand(ctx context.Context, disruptionB
 	disruptableCandidates := make([]*Candidate, 0, len(candidates))
 	constrainedByBudgets := false
 	for _, candidate := range candidates {
+		candidateSummary := summarizeCandidatesForLog([]*Candidate{candidate})
+		var candidateFields map[string]any
+		if len(candidateSummary) > 0 {
+			candidateFields = candidateSummary[0]
+		}
+		candidateLog := logger.WithValues("candidate", candidateFields)
 		// If there's disruptions allowed for the candidate's nodepool,
 		// add it to the list of candidates, and decrement the budget.
 		if disruptionBudgetMapping[candidate.NodePool.Name] == 0 {
 			constrainedByBudgets = true
+			candidateLog.V(1).Info("skipping candidate due to disruption budget", "remaining-budget", disruptionBudgetMapping[candidate.NodePool.Name])
 			continue
 		}
 		// Filter out empty candidates. If there was an empty node that wasn't consolidated before this, we should
 		// assume that it was due to budgets. If we don't filter out budgets, users who set a budget for `empty`
 		// can find their nodes disrupted here.
 		if len(candidate.reschedulablePods) == 0 {
+			candidateLog.V(1).Info("skipping candidate with zero reschedulable pods")
 			continue
 		}
 		// set constrainedByBudgets to true if any node was a candidate but was constrained by a budget
 		disruptableCandidates = append(disruptableCandidates, candidate)
+		candidateLog.V(1).Info("selected candidate for multi-node consideration")
 		disruptionBudgetMapping[candidate.NodePool.Name]--
 	}
 
 	// Only consider a maximum batch of 100 NodeClaims to save on computation.
 	// This could be further configurable in the future.
 	maxParallel := lo.Clamp(len(disruptableCandidates), 0, 100)
+	logger.WithValues("selected-candidates", summarizeCandidatesForLog(disruptableCandidates), "max-parallel", maxParallel).V(1).Info("prefiltered candidates for multi-node consolidation")
 
 	cmd, err := m.firstNConsolidationOption(ctx, disruptableCandidates, maxParallel)
 	if err != nil {
@@ -95,6 +108,9 @@ func (m *MultiNodeConsolidation) ComputeCommand(ctx context.Context, disruptionB
 		// the next time we try to disrupt.
 		if !constrainedByBudgets {
 			m.markConsolidated()
+			logger.V(1).Info("multi-node consolidation found no action, marking consolidated")
+		} else {
+			logger.V(1).Info("multi-node consolidation found no action due to budgets")
 		}
 		return cmd, nil
 	}
@@ -106,6 +122,7 @@ func (m *MultiNodeConsolidation) ComputeCommand(ctx context.Context, disruptionB
 		}
 		return Command{}, fmt.Errorf("validating consolidation, %w", err)
 	}
+	log.FromContext(ctx).WithValues(cmd.LogValues()...).Info("validated multi-node consolidation command")
 	return cmd, nil
 }
 
@@ -115,6 +132,7 @@ func (m *MultiNodeConsolidation) ComputeCommand(ctx context.Context, disruptionB
 func (m *MultiNodeConsolidation) firstNConsolidationOption(ctx context.Context, candidates []*Candidate, max int) (Command, error) {
 	// we always operate on at least two NodeClaims at once, for single NodeClaims standard consolidation will find all solutions
 	if len(candidates) < 2 {
+		log.FromContext(ctx).V(1).Info("multi-node consolidation requires at least two candidates")
 		return Command{}, nil
 	}
 	min := 1
@@ -129,6 +147,13 @@ func (m *MultiNodeConsolidation) firstNConsolidationOption(ctx context.Context, 
 	for min <= max {
 		mid := (min + max) / 2
 		candidatesToConsolidate := candidates[0 : mid+1]
+		loopLogger := log.FromContext(ctx).WithValues(
+			"batch-low", min,
+			"batch-high", max,
+			"batch-size", len(candidatesToConsolidate),
+			"candidates", summarizeCandidatesForLog(candidatesToConsolidate),
+		)
+		loopLogger.V(1).Info("attempting multi-node consolidation batch")
 
 		// Pass the timeout context to ensure sub-operations can be canceled
 		cmd, err := m.computeConsolidation(timeoutCtx, candidatesToConsolidate...)
@@ -160,9 +185,16 @@ func (m *MultiNodeConsolidation) firstNConsolidationOption(ctx context.Context, 
 			// We can consolidate NodeClaims [0,mid]
 			lastSavedCommand = cmd
 			min = mid + 1
+			loopLogger.WithValues(cmd.LogValues()...).V(1).Info("multi-node consolidation batch accepted")
 		} else {
 			max = mid - 1
+			loopLogger.V(1).Info("multi-node consolidation batch rejected, replacement invalid")
 		}
+	}
+	if lastSavedCommand.Candidates != nil {
+		log.FromContext(ctx).WithValues(lastSavedCommand.LogValues()...).V(1).Info("multi-node consolidation returning best batch")
+	} else {
+		log.FromContext(ctx).V(1).Info("multi-node consolidation found no viable batch")
 	}
 	return lastSavedCommand, nil
 }

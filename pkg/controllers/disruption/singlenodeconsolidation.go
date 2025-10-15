@@ -53,9 +53,12 @@ func NewSingleNodeConsolidation(c consolidation) *SingleNodeConsolidation {
 // nolint:gocyclo
 func (s *SingleNodeConsolidation) ComputeCommand(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) (Command, error) {
 	if s.IsConsolidated() {
+		log.FromContext(ctx).V(1).Info("single-node consolidation already satisfied, skipping")
 		return Command{}, nil
 	}
 	candidates = s.SortCandidates(ctx, candidates)
+	logger := log.FromContext(ctx).WithValues("candidate-count", len(candidates), "candidates", summarizeCandidatesForLog(candidates))
+	logger.V(1).Info("evaluating single-node consolidation candidates")
 
 	// Set a timeout
 	timeout := s.clock.Now().Add(SingleNodeConsolidationTimeoutDuration)
@@ -74,28 +77,37 @@ func (s *SingleNodeConsolidation) ComputeCommand(ctx context.Context, disruption
 		}
 		// Track that we've seen this nodepool
 		unseenNodePools.Delete(candidate.NodePool.Name)
+		candidateSummary := summarizeCandidatesForLog([]*Candidate{candidate})
+		var candidateFields map[string]any
+		if len(candidateSummary) > 0 {
+			candidateFields = candidateSummary[0]
+		}
+		candidateLog := logger.WithValues("candidate", candidateFields)
 
 		// If the disruption budget doesn't allow this candidate to be disrupted,
 		// continue to the next candidate. We don't need to decrement any budget
 		// counter since single node consolidation commands can only have one candidate.
 		if disruptionBudgetMapping[candidate.NodePool.Name] == 0 {
 			constrainedByBudgets = true
+			candidateLog.V(1).Info("skipping candidate due to disruption budget", "remaining-budget", disruptionBudgetMapping[candidate.NodePool.Name])
 			continue
 		}
 		// Filter out empty candidates. If there was an empty node that wasn't consolidated before this, we should
 		// assume that it was due to budgets. If we don't filter out budgets, users who set a budget for `empty`
 		// can find their nodes disrupted here.
 		if len(candidate.reschedulablePods) == 0 {
+			candidateLog.V(1).Info("skipping candidate due to zero reschedulable pods")
 			continue
 		}
 
 		// compute a possible consolidation option
 		cmd, err := s.computeConsolidation(ctx, candidate)
 		if err != nil {
-			log.FromContext(ctx).Error(err, "failed computing consolidation")
+			candidateLog.Error(err, "failed computing consolidation")
 			continue
 		}
 		if cmd.Decision() == NoOpDecision {
+			candidateLog.V(1).Info("candidate consolidation returned no-op")
 			continue
 		}
 		if _, err = s.Validate(ctx, cmd, consolidationTTL); err != nil {
@@ -105,6 +117,7 @@ func (s *SingleNodeConsolidation) ComputeCommand(ctx context.Context, disruption
 			}
 			return Command{}, fmt.Errorf("validating consolidation, %w", err)
 		}
+		log.FromContext(ctx).WithValues(cmd.LogValues()...).Info("validated single-node consolidation command")
 		return cmd, nil
 	}
 
@@ -113,6 +126,9 @@ func (s *SingleNodeConsolidation) ComputeCommand(ctx context.Context, disruption
 		// as consolidated, as it's possible it should be consolidatable
 		// the next time we try to disrupt.
 		s.markConsolidated()
+		logger.V(1).Info("no single-node candidates found, marking consolidated")
+	} else {
+		logger.V(1).Info("no single-node candidates found due to budgets")
 	}
 
 	s.PreviouslyUnseenNodePools = unseenNodePools
