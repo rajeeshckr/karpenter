@@ -344,6 +344,8 @@ func (r Results) TruncateInstanceTypes(ctx context.Context, maxInstanceTypes int
 
 func (s *Scheduler) Solve(ctx context.Context, pods []*corev1.Pod) (Results, error) {
 	defer metrics.Measure(DurationSeconds, map[string]string{ControllerLabel: injection.GetControllerName(ctx)})()
+	logger := log.FromContext(ctx).WithValues("scheduling-id", string(s.uuid), "pod-count", len(pods))
+	logger.V(1).Info("starting scheduler solve", "pods", summarizePodsForLog(pods))
 	// We loop trying to schedule unschedulable pods as long as we are making progress.  This solves a few
 	// issues including pods with affinity to another pod in the batch. We could topo-sort to solve this, but it wouldn't
 	// solve the problem of scheduling pods where a particular order is needed to prevent a max-skew violation. E.g. if we
@@ -366,17 +368,20 @@ func (s *Scheduler) Solve(ctx context.Context, pods []*corev1.Pod) (Results, err
 		// Try the next pod
 		pod, ok := q.Pop()
 		if !ok {
+			logger.V(1).Info("scheduling queue empty, finishing")
 			break
 		}
+		podLogger := logger.WithValues("pod", summarizePodForLog(pod))
 		// We relax the pod all the way the first time we see it
 		// If we don't schedule it, we store the original pod (with preferences)
 		// in the queue and give ourselves another chance to schedule it later
 		if err := s.trySchedule(ctx, pod.DeepCopy()); err != nil {
 			if errors.Is(err, context.DeadlineExceeded) {
-				log.FromContext(ctx).V(1).WithValues("duration", s.clock.Since(startTime).Truncate(time.Second), "scheduling-id", string(s.uuid)).Info("scheduling simulation timed out")
+				podLogger.V(1).WithValues("duration", s.clock.Since(startTime).Truncate(time.Second)).Info("scheduling simulation timed out")
 				break
 			}
 			podErrors[pod] = err
+			podLogger.V(1).WithValues("error", err).Info("pod failed to schedule, re-queuing with relaxed preferences")
 			if e := s.topology.Update(ctx, pod); e != nil && !errors.Is(e, context.DeadlineExceeded) {
 				log.FromContext(ctx).Error(e, "failed updating topology")
 			}
@@ -385,6 +390,7 @@ func (s *Scheduler) Solve(ctx context.Context, pods []*corev1.Pod) (Results, err
 			q.Push(pod)
 		} else {
 			delete(podErrors, pod)
+			podLogger.V(1).Info("pod scheduled successfully")
 		}
 	}
 	UnfinishedWorkSeconds.Delete(map[string]string{ControllerLabel: injection.GetControllerName(ctx), schedulingIDLabel: string(s.uuid)})
@@ -392,20 +398,25 @@ func (s *Scheduler) Solve(ctx context.Context, pods []*corev1.Pod) (Results, err
 		m.FinalizeScheduling()
 	}
 
-	return Results{
+	res := Results{
 		NewNodeClaims: s.newNodeClaims,
 		ExistingNodes: s.existingNodes,
 		PodErrors:     podErrors,
-	}, ctx.Err()
+	}
+	logger.WithValues("new-nodeclaim-count", len(res.NewNodeClaims), "existing-node-count", len(res.ExistingNodes), "pod-error-count", len(res.PodErrors)).Info("finished scheduler solve")
+	return res, ctx.Err()
 }
 
 func (s *Scheduler) trySchedule(ctx context.Context, p *corev1.Pod) error {
+	podLogger := log.FromContext(ctx).WithValues("pod", summarizePodForLog(p))
 	for {
 		if ctx.Err() != nil {
+			podLogger.V(1).Info("context cancelled during trySchedule")
 			return ctx.Err()
 		}
 		err := s.add(ctx, p)
 		if err == nil {
+			podLogger.V(1).Info("trySchedule succeeded without relaxation")
 			return nil
 		}
 		// We should only relax the pod's requirements when the error is not a reserved offering error because the pod may be
@@ -413,12 +424,15 @@ func (s *Scheduler) trySchedule(ctx context.Context, p *corev1.Pod) error {
 		// release the required reservations when constrained, or in subsequent runs. For an example, reference the following
 		// test: "shouldn't relax preferences when a pod fails to schedule due to a reserved offering error".
 		if IsReservedOfferingError(err) {
+			podLogger.V(1).WithValues("error", err).Info("encountered reserved offering error, not relaxing")
 			return err
 		}
 		// Eventually we won't be able to relax anymore and this while loop will exit
 		if relaxed := s.preferences.Relax(ctx, p); !relaxed {
+			podLogger.V(1).WithValues("error", err).Info("preferences fully relaxed but scheduling still failed")
 			return err
 		}
+		podLogger.V(1).Info("relaxed pod preferences and retrying")
 		if e := s.topology.Update(ctx, p); e != nil && !errors.Is(e, context.DeadlineExceeded) {
 			log.FromContext(ctx).Error(e, "failed updating topology")
 		}
@@ -448,8 +462,10 @@ func (s *Scheduler) updateCachedPodData(p *corev1.Pod) {
 }
 
 func (s *Scheduler) add(ctx context.Context, pod *corev1.Pod) error {
+	podLogger := log.FromContext(ctx).WithValues("pod", summarizePodForLog(pod))
 	// first try to schedule against an in-flight real node
 	if err := s.addToExistingNode(ctx, pod); err == nil {
+		podLogger.V(1).Info("scheduled pod onto existing node")
 		return nil
 	}
 	// Consider using https://pkg.go.dev/container/heap
@@ -457,12 +473,15 @@ func (s *Scheduler) add(ctx context.Context, pod *corev1.Pod) error {
 
 	// Pick existing node that we are about to create
 	if err := s.addToInflightNode(ctx, pod); err == nil {
+		podLogger.V(1).Info("scheduled pod onto inflight node")
 		return nil
 	}
 	err := s.addToNewNodeClaim(ctx, pod)
 	if err == nil {
+		podLogger.V(1).Info("scheduled pod onto new nodeclaim")
 		return nil
 	}
+	podLogger.V(1).WithValues("error", err).Info("failed to schedule pod on any target")
 	return err
 }
 
@@ -498,6 +517,7 @@ func (s *Scheduler) addToExistingNode(ctx context.Context, pod *corev1.Pod) erro
 	// If we set the existingNode to something valid, this means that we successfully scheduled to one of these nodes
 	if existingNode != nil {
 		existingNode.Add(pod, s.cachedPodData[pod.UID], requirements, volumes)
+		log.FromContext(ctx).V(1).WithValues("pod", summarizePodForLog(pod), "node", existingNode.Name()).Info("added pod to existing node")
 		return nil
 	}
 	return fmt.Errorf("failed scheduling pod to existing nodes")
@@ -532,6 +552,7 @@ func (s *Scheduler) addToInflightNode(ctx context.Context, pod *corev1.Pod) erro
 	})
 	if inflightNodeClaim != nil {
 		inflightNodeClaim.Add(pod, s.cachedPodData[pod.UID], updatedRequirements, updatedInstanceTypes, offeringsToReserve)
+		log.FromContext(ctx).V(1).WithValues("pod", summarizePodForLog(pod), "nodeclaim-hostname", inflightNodeClaim.hostname, "nodepool", inflightNodeClaim.NodeClaimTemplate.NodePoolName).Info("added pod to inflight nodeclaim")
 		return nil
 	}
 	return fmt.Errorf("failed scheduling pod to inflight nodes")
@@ -623,8 +644,10 @@ func (s *Scheduler) addToNewNodeClaim(ctx context.Context, pod *corev1.Pod) erro
 		newNodeClaim.Add(pod, s.cachedPodData[pod.UID], updatedRequirements, updatedInstanceTypes, offeringsToReserve)
 		s.newNodeClaims = append(s.newNodeClaims, newNodeClaim)
 		s.remainingResources[newNodeClaim.NodePoolName] = subtractMax(s.remainingResources[newNodeClaim.NodePoolName], newNodeClaim.InstanceTypeOptions)
+		log.FromContext(ctx).V(1).WithValues("pod", summarizePodForLog(pod), "nodeclaim-hostname", newNodeClaim.hostname, "nodepool", newNodeClaim.NodeClaimTemplate.NodePoolName, "instance-type-count", len(newNodeClaim.InstanceTypeOptions)).Info("created new nodeclaim for pod")
 		return nil
 	}
+	log.FromContext(ctx).V(1).WithValues("pod", summarizePodForLog(pod)).Info("unable to create new nodeclaim for pod")
 	return multierr.Combine(errs...)
 }
 
@@ -777,4 +800,23 @@ func filterByRemainingResources(instanceTypes []*cloudprovider.InstanceType, rem
 		}
 	}
 	return filtered
+}
+
+func summarizePodForLog(pod *corev1.Pod) map[string]any {
+	if pod == nil {
+		return map[string]any{}
+	}
+	return map[string]any{
+		"namespace": pod.Namespace,
+		"name":      pod.Name,
+		"node":      pod.Spec.NodeName,
+		"phase":     pod.Status.Phase,
+		"priority":  pod.Spec.Priority,
+	}
+}
+
+func summarizePodsForLog(pods []*corev1.Pod) []map[string]any {
+	return lo.Map(pods, func(p *corev1.Pod, _ int) map[string]any {
+		return summarizePodForLog(p)
+	})
 }

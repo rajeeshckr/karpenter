@@ -76,7 +76,7 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 		logger.Error(err, "determining pending pods failed")
 		return scheduling.Results{}, fmt.Errorf("determining pending pods, %w", err)
 	}
-	logger.V(1).Info("fetched pending pods", "pending-pod-count", len(pods))
+	logger.V(1).Info("fetched pending pods", "pending-pod-count", len(pods), "pod-names", lo.Map(pods, func(p *corev1.Pod, _ int) string { return p.Name }))
 
 	// Don't provision capacity for pods which will not get evicted due to fully blocking PDBs.
 	// Since Karpenter doesn't know when these pods will be successfully evicted, spinning up capacity until
@@ -88,6 +88,8 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 	}
 	for _, n := range candidates {
 		currentlyReschedulablePods := lo.Filter(n.reschedulablePods, func(p *corev1.Pod, _ int) bool {
+			// print pod names and its reschedulable status before  return
+			logger.V(1).Info("checking pod reschedulable status", "pod-name", p.Name, "reschedulable", pdbs.IsCurrentlyReschedulable(p))
 			return pdbs.IsCurrentlyReschedulable(p)
 		})
 		if len(currentlyReschedulablePods) != len(n.reschedulablePods) {
@@ -103,6 +105,8 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 		logger.Error(err, "failed to get pods from deleting nodes")
 		return scheduling.Results{}, fmt.Errorf("failed to get pods from deleting nodes, %w", err)
 	}
+	// print deleting node pods
+	logger.V(1).Info("fetched deleting node pods", "deleting-node-pod-count", len(deletingNodePods), "pod-names", lo.Map(deletingNodePods, func(p *corev1.Pod, _ int) string { return p.Name }))
 	pods = append(pods, deletingNodePods...)
 	logger.V(1).Info("aggregated pods for scheduling", "total-pod-count", len(pods), "deleting-node-pod-count", len(deletingNodePods))
 
