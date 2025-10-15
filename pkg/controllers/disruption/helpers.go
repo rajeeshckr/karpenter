@@ -51,11 +51,14 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 	candidates ...*Candidate,
 ) (scheduling.Results, error) {
 	candidateNames := sets.NewString(lo.Map(candidates, func(t *Candidate, i int) string { return t.Name() })...)
+	logger := log.FromContext(ctx).WithValues("candidate-count", len(candidates), "candidates", summarizeCandidatesForLog(candidates))
+	logger.V(1).Info("starting scheduling simulation")
 	nodes := cluster.Nodes()
 	deletingNodes := nodes.Deleting()
 	stateNodes := lo.Filter(nodes.Active(), func(n *state.StateNode, _ int) bool {
 		return !candidateNames.Has(n.Name())
 	})
+	logger.V(1).Info("filtered cluster state", "active-node-count", len(nodes.Active()), "state-node-count", len(stateNodes), "deleting-node-count", len(deletingNodes))
 
 	// We do one final check to ensure that the node that we are attempting to consolidate isn't
 	// already handled for deletion by some other controller. This could happen if the node was markedForDeletion
@@ -63,35 +66,45 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 	if _, ok := lo.Find(deletingNodes, func(n *state.StateNode) bool {
 		return candidateNames.Has(n.Name())
 	}); ok {
+		logger.V(1).Info("abandoning scheduling simulation, candidate already deleting")
 		return scheduling.Results{}, errCandidateDeleting
 	}
 
 	// start by getting all pending pods
 	pods, err := provisioner.GetPendingPods(ctx)
 	if err != nil {
+		logger.Error(err, "determining pending pods failed")
 		return scheduling.Results{}, fmt.Errorf("determining pending pods, %w", err)
 	}
+	logger.V(1).Info("fetched pending pods", "pending-pod-count", len(pods))
 
 	// Don't provision capacity for pods which will not get evicted due to fully blocking PDBs.
 	// Since Karpenter doesn't know when these pods will be successfully evicted, spinning up capacity until
 	// these pods are evicted is wasteful.
 	pdbs, err := pdb.NewLimits(ctx, kubeClient)
 	if err != nil {
+		logger.Error(err, "tracking PodDisruptionBudgets failed")
 		return scheduling.Results{}, fmt.Errorf("tracking PodDisruptionBudgets, %w", err)
 	}
 	for _, n := range candidates {
 		currentlyReschedulablePods := lo.Filter(n.reschedulablePods, func(p *corev1.Pod, _ int) bool {
 			return pdbs.IsCurrentlyReschedulable(p)
 		})
+		if len(currentlyReschedulablePods) != len(n.reschedulablePods) {
+			logger.V(1).WithValues("candidate", summarizeCandidatesForLog([]*Candidate{n})).Info("filtered candidate pods by pdb limits",
+				"original-count", len(n.reschedulablePods), "reschedulable-count", len(currentlyReschedulablePods))
+		}
 		pods = append(pods, currentlyReschedulablePods...)
 	}
 
 	// We get the pods that are on nodes that are deleting
 	deletingNodePods, err := deletingNodes.CurrentlyReschedulablePods(ctx, kubeClient)
 	if err != nil {
+		logger.Error(err, "failed to get pods from deleting nodes")
 		return scheduling.Results{}, fmt.Errorf("failed to get pods from deleting nodes, %w", err)
 	}
 	pods = append(pods, deletingNodePods...)
+	logger.V(1).Info("aggregated pods for scheduling", "total-pod-count", len(pods), "deleting-node-pod-count", len(deletingNodePods))
 
 	var opts []scheduling.Options
 	if options.FromContext(ctx).PreferencePolicy == options.PreferencePolicyIgnore {
@@ -105,6 +118,7 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 		opts...,
 	)
 	if err != nil {
+		logger.Error(err, "creating scheduler failed")
 		return scheduling.Results{}, fmt.Errorf("creating scheduler, %w", err)
 	}
 
@@ -114,9 +128,12 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 
 	results, err := scheduler.Solve(log.IntoContext(ctx, operatorlogging.NopLogger), pods)
 	if err != nil {
+		logger.Error(err, "scheduling pods failed")
 		return scheduling.Results{}, fmt.Errorf("scheduling pods, %w", err)
 	}
 	results = results.TruncateInstanceTypes(ctx, scheduling.MaxInstanceTypes)
+	logger.V(1).Info("scheduler simulation completed", "new-nodeclaim-count", len(results.NewNodeClaims),
+		"existing-node-count", len(results.ExistingNodes), "pod-error-count", len(results.PodErrors))
 	for _, n := range results.ExistingNodes {
 		// We consider existing nodes for scheduling. When these nodes are unmanaged, their taint logic should
 		// tell us if we can schedule to them or not; however, if these nodes are managed, we will still schedule to them
@@ -135,8 +152,10 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 					results.PodErrors[p] = NewUninitializedNodeError(n)
 				}
 			}
+			logger.V(1).Info("detected scheduling against uninitialized existing node", "existing-node", n.Name, "pod-count", len(n.Pods))
 		}
 	}
+	logger.WithValues("new-nodeclaim-count", len(results.NewNodeClaims), "existing-node-count", len(results.ExistingNodes), "pod-error-count", len(results.PodErrors)).Info("finished scheduling simulation")
 	return results, nil
 }
 
